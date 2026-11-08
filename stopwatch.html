@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>말티즈 스탑워치</title>
+<style>
+  :root { --bg:#fdf3e7; --card:#fff; --text:#3a2e2a; --muted:#a39488; --accent:#ff8fa3; --stop:#6c9bd1; --line:#f1e4d6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1d1916; --card:#272220; --text:#f6ece4; --muted:#9c8f84; --line:#3a332f; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+    background:var(--bg); color:var(--text); font-family:'Segoe UI','Malgun Gothic',sans-serif; padding:16px; }
+  .card { background:var(--card); border-radius:24px; padding:18px; width:100%; max-width:760px;
+    box-shadow:0 10px 36px rgba(120,80,40,.15); }
+  .scene { position:relative; border-radius:16px; overflow:hidden; line-height:0; }
+  canvas { width:100%; height:auto; display:block; }
+  .lapbox { position:absolute; top:10px; left:10px; max-height:46%; min-width:150px; overflow-y:auto;
+    background:rgba(255,255,255,.82); color:#3a2e2a; border-radius:12px; padding:6px 10px;
+    font-size:13px; line-height:1.5; font-variant-numeric:tabular-nums; display:none;
+    backdrop-filter:blur(3px); box-shadow:0 2px 10px rgba(0,0,0,.12); }
+  .lapbox div { display:flex; justify-content:space-between; gap:14px; }
+  .lapbox div span:first-child { color:#a39488; }
+  .lapbox .best { color:#16a34a; font-weight:700; }
+  .lapbox .worst { color:#e11d48; font-weight:700; }
+  .time { font-size:clamp(40px,11vw,62px); font-weight:300; text-align:center;
+    font-variant-numeric:tabular-nums; letter-spacing:1px; margin:14px 0 14px; }
+  .time small { font-size:.5em; color:var(--muted); }
+  .btns { display:flex; gap:12px; }
+  button { flex:1; padding:14px; font-size:16px; font-weight:700; border:none; border-radius:14px;
+    cursor:pointer; color:#fff; transition:opacity .15s, transform .05s; }
+  button:active { transform:scale(.97); }
+  button:disabled { opacity:.35; cursor:default; }
+  #start { background:var(--accent); }
+  #start.running { background:var(--stop); }
+  #lap, #reset { background:#b9a99b; }
+  .hint { text-align:center; color:var(--muted); font-size:12px; margin-top:12px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="scene">
+    <canvas id="cv"></canvas>
+    <div class="lapbox" id="laps"></div>
+  </div>
+  <div class="time" id="display">00:00.<small>00</small></div>
+  <div class="btns">
+    <button id="lap" disabled>랩</button>
+    <button id="start">시작</button>
+    <button id="reset" disabled>초기화</button>
+  </div>
+  <div class="hint">스페이스: 시작/정지 · L: 랩 · R: 초기화<br>이미지: Google Noto Emoji (Apache-2.0) · Twemoji (CC-BY 4.0)</div>
+</div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const display = $('display'), startBtn = $('start'), lapBtn = $('lap'), resetBtn = $('reset'), lapsEl = $('laps');
+  const cv = $('cv'), ctx = cv.getContext('2d');
+  const W = 720, H = 300, GY = 250, SPEED = 300, START_X = 90, RUN_X = 230;
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  cv.width = W * dpr; cv.height = H * dpr; ctx.scale(dpr, dpr);
+
+  /* ---------- 스톱워치 로직 ---------- */
+  let running = false, startTime = 0, elapsed = 0, laps = [], lastLapTime = 0;
+  const pad = (n, l = 2) => String(n).padStart(l, '0');
+  function fmt(ms) {
+    const m = Math.floor(ms / 60000), s = Math.floor(ms / 1000) % 60, c = Math.floor(ms / 10) % 100;
+    return { text: `${pad(m)}:${pad(s)}.`, cs: pad(c) };
+  }
+  const fmtFull = ms => { const f = fmt(ms); return f.text + f.cs; };
+
+  function renderTime() {
+    const cur = running ? performance.now() - startTime : elapsed;
+    const f = fmt(cur);
+    display.innerHTML = `${f.text}<small>${f.cs}</small>`;
+  }
+
+  function toggle() {
+    if (running) {
+      elapsed = performance.now() - startTime;
+      running = false;
+      startBtn.textContent = '계속'; startBtn.classList.remove('running');
+      lapBtn.disabled = true;
+      enterSit();
+    } else {
+      startTime = performance.now() - elapsed;
+      running = true;
+      startBtn.textContent = '정지'; startBtn.classList.add('running');
+      lapBtn.disabled = false; resetBtn.disabled = false;
+      state = 'run';
+    }
+    renderTime();
+  }
+
+  function lap() {
+    if (!running) return;
+    const now = performance.now() - startTime;
+    laps.push({ split: now - lastLapTime, total: now });
+    lastLapTime = now;
+    drawLaps();
+    triggerLapEvent();
+  }
+
+  function drawLaps() {
+    lapsEl.innerHTML = '';
+    lapsEl.style.display = laps.length ? 'block' : 'none';
+    let best = -1, worst = -1;
+    if (laps.length > 1) {
+      const s = laps.map(l => l.split);
+      best = s.indexOf(Math.min(...s)); worst = s.indexOf(Math.max(...s));
+    }
+    for (let i = laps.length - 1; i >= 0; i--) {
+      const d = document.createElement('div');
+      if (i === best) d.className = 'best'; else if (i === worst) d.className = 'worst';
+      d.innerHTML = `<span>랩 ${i + 1}</span><span>${fmtFull(laps[i].split)}</span>`;
+      d.title = '누적 ' + fmtFull(laps[i].total);
+      lapsEl.appendChild(d);
+    }
+    lapsEl.scrollTop = 0;
+  }
+
+  function reset() {
+    running = false; elapsed = 0; lastLapTime = 0; laps = [];
+    startBtn.textContent = '시작'; startBtn.classList.remove('running');
+    lapBtn.disabled = true; resetBtn.disabled = true;
+    drawLaps(); renderTime();
+    state = 'idle'; dogX = START_X; scroll = 0;
+    hurdles = []; treat = null; jump = null; hearts = []; bag = [];
+  }
+
+  startBtn.onclick = toggle; lapBtn.onclick = lap; resetBtn.onclick = reset;
+  document.addEventListener('keydown', e => {
+    if (e.code === 'Space') { e.preventDefault(); toggle(); }
+    else if (e.key.toLowerCase() === 'l') lap();
+    else if (e.key.toLowerCase() === 'r' && !resetBtn.disabled) reset();
+  });
+
+  /* ---------- 애니메이션 상태 ---------- */
+  let state = 'idle';           // idle | run | sit
+  let dogX = START_X, scroll = 0, t = 0, runPhase = 0, sitT = 0;
+  let hurdles = [], treat = null, jump = null, hearts = [];
+  let bag = [];                 // 장애물/간식 5:5 보장용
+  const THROW_T = 0.95;         // 간식이 입에 도착하는 시간
+
+  function enterSit() { state = 'sit'; sitT = 0; hurdles = []; treat = null; jump = null; }
+
+  function triggerLapEvent() {
+    if (treat || jump) return;
+    if (!bag.length) bag = Math.random() < 0.5 ? ['hurdle', 'treat'] : ['treat', 'hurdle'];
+    if (bag.shift() === 'hurdle') hurdles.push({ x: W + 30 });
+    else treat = { t: 0, eaten: false };
+  }
+
+  function update(dt) {
+    t += dt;
+    if (state === 'run') {
+      scroll += SPEED * dt;
+      runPhase += dt * 14;
+      dogX += (RUN_X - dogX) * Math.min(1, dt * 3);
+      for (const h of hurdles) h.x -= SPEED * dt;
+      hurdles = hurdles.filter(h => h.x > -80);
+      if (!jump) {
+        const h = hurdles.find(h => h.x - dogX < 120 && h.x > dogX - 10);
+        if (h) jump = { t: 0 };
+      } else {
+        jump.t += dt;
+        if (jump.t > 0.75) jump = null;
+      }
+      if (treat) {
+        treat.t += dt;
+        if (treat.t > THROW_T && !treat.eaten) {
+          treat.eaten = true;
+          for (let i = 0; i < 4; i++) hearts.push({ x: dogX + 40 + i * 14, y: GY - 140, age: -i * 0.12 });
+        }
+        if (treat.t > 1.9) treat = null;
+      }
+    } else if (state === 'sit') {
+      sitT += dt;
+    }
+    hearts.forEach(h => h.age += dt);
+    hearts = hearts.filter(h => h.age < 1.2);
+  }
+
+  /* ---------- 그리기 도우미 ---------- */
+  const FUR = '#ffffff', CREAM = '#f7efe4', EDGE = '#d3d0d8';
+  // 몽글몽글한 구름 같은 털 덩어리
+  function fluffy(cx, cy, rx, ry, n = 14, r = null, color = FUR) {
+    r = r || Math.min(rx, ry) * 0.4;
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const a = i / n * Math.PI * 2;
+      pts.push([cx + Math.cos(a) * rx, cy + Math.sin(a) * ry]);
+    }
+    ctx.fillStyle = color; ctx.strokeStyle = EDGE; ctx.lineWidth = 3;
+    for (const [x, y] of pts) { ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); ctx.stroke(); }
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, 7); ctx.fill(); ctx.stroke();
+    for (const [x, y] of pts) { ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); }
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, 7); ctx.fill();
+  }
+  function limb(x1, y1, x2, y2, w) {
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = EDGE; ctx.lineWidth = w + 3;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.strokeStyle = FUR; ctx.lineWidth = w;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+  function leg(x, a, w = 13) {
+    const px = x, py = -36, L = 30;
+    const ex = px + Math.sin(a) * L, ey = py + Math.cos(a) * L;
+    limb(px, py, ex, ey, w);
+    fluffy(ex, ey - 1, 7, 5, 6, 4);
+  }
+  function heart(x, y, s, alpha) {
+    ctx.save(); ctx.globalAlpha = alpha; ctx.fillStyle = '#ff5d7a';
+    ctx.translate(x, y); ctx.scale(s, s);
+    ctx.beginPath();
+    ctx.moveTo(0, 4); ctx.bezierCurveTo(-10, -4, -6, -12, 0, -6); ctx.bezierCurveTo(6, -12, 10, -4, 0, 4);
+    ctx.fill(); ctx.restore();
+  }
+  function bone(x, y, s = 1, rot = 0) {
+    if (!IMG.bone || !IMG.bone.complete) return;
+    ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(s, s);
+    ctx.drawImage(IMG.bone, -22, -22, 44, 44);
+    ctx.restore();
+  }
+
+  /* ---------- 강아지 (Noto Emoji 이미지) ---------- */
+  const IMG = {};
+  const SRC = { side: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzNiAzNiI+PHBhdGggZmlsbD0iI0Q5OUU4MiIgZD0iTTMxLjAzNCAxNC4zNzRjMy41MDgtLjY1IDMuNTg3LTYuMjk3LS4wNTEtNi4yNTQtMi44NDcuMDM0LTIuNTYgMi43OTUtMi45NDUgMi4yNTItLjc0OC0xLjA1NS0uOTg5LTMuNzY5IDEuODYyLTQuODk0IDIuNDYxLS45NzEgNS44NDYuOTk2IDYuMDYzIDQuNTkxLjEzOSAyLjMwMi0xLjI5NyA2LjU1NC02LjQ1MyA1Ljg0Ni03LjIyMi0uOTkxLTEuOTgzLS44OTIgMS41MjQtMS41NDF6Ii8+PHBhdGggZmlsbD0iI0MxNjk0RiIgZD0iTTEwLjMyMSAyMS45MzVzMS4wMTYgMi4zNTIuNjc2IDguMjQyYy0uMDYxIDEuMDU3LS4yMDkgMi4xMzYtLjI0MiAzLjAyMi0xLjgxMiAwLTEuNjUyIDIuMDY0LTEuMjY4IDIuMDY0aDIuOTAyYy42ODMgMCAxLjg5My0zLjQzOCAyLjIxMi04LjIwOS4zMTktNC43NzItNC4yOC01LjExOS00LjI4LTUuMTE5em0xMS44OS0uMzMxcy41NzUgMy41MjggMy42NTEgNi40MTNjLjI1NyAxLjE2My43NjkgNC4yMzIuOTQ5IDUuMTk1LTEuODg5IDAtMS4yODIgMi4wNDctLjczMSAyLjA0N2gyLjY0NmMuOTUxIDAgMS4wOTItMy40NDIuMjA2LTcuNjk0LS44ODUtNC4yNTEtNi43MjEtNS45NjEtNi43MjEtNS45NjF6Ii8+PHBhdGggZmlsbD0iI0Q5OUU4MiIgZD0iTTMyLjIwMiAxNS42NTRjLTEuMjUzLTMuNzUyLTcuMjE0LTMuNjI4LTEzLjk5Ny0yLjc2NS0zLjA1NS4zODktMy42NC00LjQ1My0zLjY0LTUuMjg2IDAtMy42MjYtMy4yNDQtNS40NTUtNi40OTYtNC4yMjktLjc3OS4yOTMtMS40MDIgMS4zMy0xLjc1NCAxLjg3Mi0xLjk3NyAzLjAzNy00LjY1OC4wMTUtNC45MTcgMi44MjItLjMxMyAzLjM5NSAxLjcyMSA0LjUzNCA1LjA1MSA0LjgyMSAxLjg5Mi4xNjMgMy40NTkgMS4wOTUgMy44NzEgNS4wNDQuMTU0IDEuNDcyLS4yOTUgNS42NDQgMi4zODggNy4wNzYuNzggMi45NTkgMS44MzYgNi42MTUgMi4yNSA4LjQ3NS0yLjI1Mi40NzYtMS4zNDEgMi4xNzktMS4zNDEgMi4xNzlzMy4xNTEtLjA0MyAzLjgzNi0uMDQzYy44MTQgMCAuMTkxLTUuOTc2LS45MzUtOS43ODcgNC43NjQuMDQzIDcuODI4LTEuMzM3IDguNzk5LTEuNzYyIDEuMDI4IDIuOTYgNC4xNTIgMy42MzMgNC44NTEgNC44OTIuNDMzLjc4IDEuODc4IDMuMzgzIDIuMDAxIDQuNDk2LTEuNjAyLjUyLTEuMDkxIDEuNzMyLS45MDkgMi4xMjIgMS4wODMtLjA0MyAzLjIyLS4wNDMgMy40OTgtLjA0MyAxLjExIDAtMS4xMzctNi45MDQtMi4wODMtOC43MTMtMS4wODItMi4wNzEuNzgxLTcuNDE5LS40NzMtMTEuMTcxeiIvPjxwYXRoIGZpbGw9IiNGNEM3QjUiIGQ9Ik0xNi4yNjYgMjQuNDY0Yy4wNDQuMzcxLjE0MS44OTEuMjUzIDEuMzY5IDQuNzY0LjA0MyA3LjgyOC0xLjMzNyA4Ljc5OS0xLjc2Mi0uMjE1LS43OC0uMjMtMS4yNy0uMTcxLTEuNTM4LTMuMzk0LjU1Ny00LjU0OCAyLjIwNS04Ljg4MSAxLjkzMXpNNi40NDkgMTIuODg5YzEuODkyLjE2MyAyLjQyNSAxLjA2OSAyLjgzOCA1LjAxOC4xNTQgMS40NzIuNzM5IDUuNjcgMy40MjEgNy4xMDItLjcyLTIuNzg4LTEuOTU5LTEyLjM4OC02LjI1OS0xMi4xMnoiLz48cGF0aCBmaWxsPSIjRjRDN0I1IiBkPSJNMy4xNTMgNi42NjVjLTIuNzkzIDAtMS45MDkuNTI2LTIuMDAyIDEuNjkyLS4wOTMgMS4xNjYtLjA3NCAyLjk3Ni43NzYgMy45MjkgMS4xMjcgMS4yNjIgMy44NTggMS4yNjYgNS4yMTUuMjc3cy0uNDI0LTUuODk4LTMuOTg5LTUuODk4eiIvPjxwYXRoIGZpbGw9IiMyNzJCMkIiIGQ9Ik0yLjUwMyA4LjMyNmMtLjEwOS43NjItLjQ5NCAxLjE5Mi0uODc5IDEuMTMzQy44NjQgOS4zNDIuMjMyIDguMzcyLjIzMiA3LjYwM3MuNjI0LS45NjMgMS4zOTItLjkyOGMxLjA0My4wNDggMS4wMDIuNzg4Ljg3OSAxLjY1MXoiLz48cGF0aCBmaWxsPSIjNjYyMTEzIiBkPSJNMTUuMTY3IDkuMDI2Yy4zNDggMi41MTUtMS4xNTcgMi44OTgtMi4zODMgMi44OThzLTMuMDU0LTEuMjUtMi43NDgtMy43N2MuMTM0LTEuMTA3LjU1NS0yLjE5My44MDktMy4xNzUuMzM2LTEuMzAzIDEuMTk5LTEuNzMyIDEuODk0LTEuMzY3IDEuNjY1Ljg3NCAyLjIwMyAzLjc5NyAyLjQyOCA1LjQxNHoiLz48Y2lyY2xlIGZpbGw9IiMyOTJGMzMiIGN4PSI4LjA2OSIgY3k9IjYuNjc1IiByPSIuOTI4Ii8+PHBhdGggZmlsbD0iI0MxNjk0RiIgZD0iTTE5LjAzNSAxMi43ODljLjA3MyAxLjUzMi45MDYgMy4xNzggMi43MzMgMy42NjMgMS45MDEuNTA1IDQuMTIuMTI3IDQuNjctMi40NzUuMDkxLS40My4xMy0xLjIyNC4wNzMtMS41MTQtMi4xNTEtLjE3OS00LjczIDAtNy40NzYuMzI2eiIvPjxjaXJjbGUgZmlsbD0iI0Q5OUU4MiIgY3g9IjMuMDUzIiBjeT0iMTAuNTAzIiByPSIuNDg4Ii8+PGNpcmNsZSBmaWxsPSIjRDk5RTgyIiBjeD0iMy42OTUiIGN5PSI5LjgwNCIgcj0iLjI2OSIvPjxjaXJjbGUgZmlsbD0iI0Q5OUU4MiIgY3g9IjQuMSIgY3k9IjEwLjUwMyIgcj0iLjI2OSIvPjwvc3ZnPg==', dog: 'data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPCEtLSBHZW5lcmF0b3I6IEFkb2JlIElsbHVzdHJhdG9yIDI0LjEuMiwgU1ZHIEV4cG9ydCBQbHVnLUluIC4gU1ZHIFZlcnNpb246IDYuMDAgQnVpbGQgMCkgIC0tPgo8c3ZnIHZlcnNpb249IjEuMSIgaWQ9IkxheWVyXzMiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGxpbmsiIHg9IjBweCIgeT0iMHB4IgoJIHZpZXdCb3g9IjAgMCAxMjggMTI4IiBzdHlsZT0iZW5hYmxlLWJhY2tncm91bmQ6bmV3IDAgMCAxMjggMTI4OyIgeG1sOnNwYWNlPSJwcmVzZXJ2ZSI+CjxwYXRoIHN0eWxlPSJmaWxsOiNGRkQyQjE7IiBkPSJNMjguOTQsNjMuMTVjMCwwLTIuMzksNi45LTAuOTksMTQuMjJjMS40MSw3LjMyLDMuMzgsMTQuMDgsMy4zOCwxNC4wOHMwLjQyLDE0LjM2LDAsMTUuOTEKCWMtMC40MiwxLjU1LTMuNjYsMy41Mi0zLjY2LDYuMzRzMS4wMyw2LjM4LDYuMjQsNy4yM3M5LjQzLTAuODksMTEuMTctM2MyLjUxLTMuMDUsMi4wMi01LjIxLDIuMDItNy40NmMwLTIuMjUsMC4xNC0xNS4yLDAuNy0xNy4xOAoJYzAuNTYtMS45NywxLjQxLTMuMSwyLjk2LTIuOTZjMS41NSwwLjE0LDMuMjQsMi41MywzLjM4LDcuMDRjMC4xNCw0LjUsMC4yOCwxMi4zOSwwLjE0LDEzLjk0Yy0wLjE0LDEuNTUtMS41NSw2Ljc2LTAuNDIsOC44NwoJYzEuMTMsMi4xMSw2LjI0LDQuMTYsMTAuMTgsMy45NGM1LjE2LTAuMjgsOC4yNi0zLjUyLDguNTQtNi4wNWMwLjI4LTIuNTMtMS40MS04LjMxLTEuNDEtMTBjMC0xLjY5LDEuOTctMTMuMjMsMi41My0xMy45NAoJYzAuNTYtMC43LDIuMjgtMC41NSw2LjA1LTIuMjVjMy40My0xLjU1LDUuMjYtMy4xLDUuMjYtMy4xczAuMDksMTAtMC4wNSwxMS4xMmMtMC4xNCwxLjEzLTMuNTIsNC42NS0yLjk2LDcuMzIKCWMwLjU2LDIuNjcsMy44Niw0LjIzLDYuOCw0LjVjNC45NywwLjQ3LDkuODEtMy4zOCwxMS4wNy02Ljc2YzEuMjctMy4zOCwwLjctNy42LDAuNDItOS44NWMtMC4yOC0yLjI1LTAuMjgtMTAuMTQsMC0xMi4yNQoJYzAuMjgtMi4xMSwwLjc0LTMuMzksMC45Mi00LjVjMC4yOC0xLjgzLDAuMjEtMy44NywwLjIxLTMuODdzNC44NiwwLDcuNzQtMS45czUuOTEtNS4yMSw3LjI1LTkuMjljMS4zMS0zLjk5LDAuOTktNS4yMS0wLjE0LTUuMzUKCWMtMS4xMy0wLjE0LTYuMTksNi45Ni0xMC40OSw3LjE4Yy02LjgzLDAuMzUtNi4xNS02Ljk3LTExLjM2LTExLjRjLTUuODctNS0xNS4wMi01LjYzLTE1LjAyLTUuNjNzMS41OC01LjkxLDEuNi0xMC4yOAoJYzAuMDctMTkuMDgtOS4yMi0yNS41NS05LjIyLTI1LjU1UzYwLjYxLDMuOTUsNDcuOTQsNC41MVMyNS45OCwxNS4xNCwyNS45OCwxNS4xNEwxOS4wMSw0NS45YzAsMCwxLjc2LDUuOTEsNC41OCwxMC4yMQoJQzI2LjU1LDYwLjYxLDI4Ljk0LDYzLjE1LDI4Ljk0LDYzLjE1eiIvPgo8cGF0aCBzdHlsZT0iZmlsbDpub25lO3N0cm9rZTojNkJBM0FCO3N0cm9rZS1taXRlcmxpbWl0OjEwOyIgZD0iTTk4LjI3LDU4LjI5Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiM4NjVCNTI7IiBkPSJNMjAuMTQsOC4zMkM5Ljc5LDguNTMsNC4zMiwxNy4zNSw0LjE2LDIyLjc1Yy0wLjA5LDMuMTctMS4zNCwyNi4yMSwxMS40LDI2LjY4CgljNS4xMSwwLjE5LDguOTEtNS43NCwxMC44NC0xMi40NmMyLjQzLTguNDcsMi4zMi0xNi45NiwyLjYtMTkuMjJjMC40NS0zLjYxLDEuMi02LjI2LDEuMi02LjI2UzI4Ljk0LDguMTQsMjAuMTQsOC4zMnoiLz4KPHBhdGggc3R5bGU9ImZpbGw6Izg2NUI1MjsiIGQ9Ik03NS41NCw0LjhjMTEuMjYsMC40MiwxNS4xLDUuNDEsMTYuMTksOC4zMWMxLjIsMy4xNywyLjI1LDE0LjQ4LDAuNDksMjIuMDMKCWMtMS40Myw2LjE2LTMuNTksOS4yOS04LjY2LDkuMDhjLTQuNjQtMC4xOS02Ljk5LTYuODgtMTAuNDktMTUuOThjLTMuMzgtOC44LTUuOTctMTYuNjgtNi40MS0xNy44MWMtMC41Ni0xLjQ4LTEuNzYtMi4xMS0xLjc2LTIuMTEKCVM2Ny4xNSw0LjQ4LDc1LjU0LDQuOHoiLz4KPHBhdGggc3R5bGU9ImZpbGw6I0QyNzg1NjsiIGQ9Ik02Mi42NiwyNy42N2MtNS41NiwwLjM1LTguMjIsNi41My03LjA0LDEyLjc0YzEuMjcsNi42OSw1LjY2LDkuODYsMTEuMTksOS4xNQoJYzYuMDUtMC43Nyw3Ljg4LTcuNjcsNy4xMS0xMi44OEM3My4yMSwzMS45NCw3MC41MywyNy4xNyw2Mi42NiwyNy42N3oiLz4KPHBhdGggc3R5bGU9ImZpbGw6IzA2MDQwMTsiIGQ9Ik02OS4yLDM5YzAsMi45Mi0xLjYyLDUuMzYtNC4xOSw1LjI5Yy0zLjQ5LTAuMS00LjQtMy4xOS00LjMzLTUuNzljMC4wOC0zLjA0LDEuOS00LjQ4LDQuNS00LjQxCglDNjcuNSwzNC4xNCw2OS4yLDM2LjA4LDY5LjIsMzl6Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiMwNjA0MDE7IiBkPSJNMzkuODUsNDAuNjFjMCwzLjA0LTEuNjIsNS41OC00LjE5LDUuNWMtMy40OS0wLjEtNC40LTMuMzItNC4zMy02LjAzYzAuMDgtMy4xNywyLjI1LTQuNTIsNC4yOS00LjM3CglDMzcuOTMsMzUuODgsMzkuODUsMzcuNTcsMzkuODUsNDAuNjF6Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiMwNjA0MDE7IiBkPSJNNTMuMjIsNTcuNTljMCwwLDYuMTItMC42Myw1Ljg0LTUuMDdjLTAuMjgtNC40My00LjQzLTQuNzItNy42Ny00LjY1CgljLTMuMjQsMC4wNy03Ljg4LDEuNzYtNy4zOSw1LjQ5YzAuNDksMy43Myw1Ljc3LDQuMjIsNS43Nyw0LjIycy0wLjAxLDIuNzYtMS44MywyLjk2Yy0xLjk3LDAuMjEtNC43OS0yLjgyLTUuNTYtMy41OQoJYy0wLjc3LTAuNzctMS45Ny0wLjQ5LTIuMzksMC4xNHMtMC4xNCwyLjA0LDEuMDYsMy4yNHM0LjAxLDQuMjIsNi44MywzLjk0YzIuODItMC4yOCwyLjg5LTEuNzYsNC4wMS0xLjgzCgljMS4xMy0wLjA3LDEuMDYsMS42MiwzLjg3LDEuNTVjMS45OC0wLjA1LDUuOTctMy41Myw2LjY5LTQuMTVjMS42Mi0xLjQxLDIuMDQtMi44MiwxLjM0LTMuNzNzLTIuNjcsMC40Mi0zLjczLDEuMgoJYy0xLjA2LDAuNzctMi43NywyLjU5LTQuNDMsMi44OUM1Mi44Nyw2MC42OSw1My4yMiw1Ny41OSw1My4yMiw1Ny41OXoiLz4KPHBhdGggc3R5bGU9ImZpbGw6I0QyNzg1NjsiIGQ9Ik03OC4yMSw1MC45OWMwLDAtMS4zMywyLjkyLTIuNDQsNS4yNmMtMS4zNCwyLjgyLTMuMjYsNS4yOC0zLjI2LDUuMjhzMi4xNywxNC44NCwxNS4wOCwxMy41NgoJYzQuNjItMC40Niw4LjEyLTQuMDgsOC40NS03LjkyYzAuNTYtNi40OC0xLjktOS41MS01LjcyLTEyLjQ3Qzg0LjEzLDQ5LjkyLDc4LjIxLDUwLjk5LDc4LjIxLDUwLjk5eiIvPgo8cGF0aCBzdHlsZT0iZmlsbDojRDI3ODU2OyIgZD0iTTY5LjI3LDc0LjJjLTIuMjksMi4xLTEuMDYsNi4wNSwxLjk3LDYuNDhjMy4wMywwLjQyLDQuNjYtMi4xLDQuNDMtNC4wMQoJQzc1LjMzLDczLjcxLDcxLjg4LDcxLjgxLDY5LjI3LDc0LjJ6Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiNEMjc4NTY7IiBkPSJNMzkuMzYsNzAuM2MwLDAtMi4wMiw1LjU0LDIuMjUsMTIuNDhjMS44MiwyLjk1LDUuODcsNC42MSw4LjczLDQuNWMzLjAyLTAuMTEsNS43NS0xLjE2LDguMDktNC4wOAoJYzMuNzMtNC42NSwyLjY3LTEyLjM5LDIuNjctMTIuMzlzLTUuOTEsMi40My0xMS4zMywyLjI1QzQ0LDcyLjg4LDM5LjM2LDcwLjMsMzkuMzYsNzAuM3oiLz4KPHBhdGggc3R5bGU9ImZpbGw6I0QyNzg1NjsiIGQ9Ik0zMS45OSwxMTIuN2MtMS40Ny0wLjQ1LTIuMDYsMS44My0yLjE2LDMuMjhzLTAuMDksMy4zMywxLjIyLDMuOGMxLjMxLDAuNDcsMS4wNS0yLjMyLDEuMTctMy4yNAoJQzMyLjQ2LDExNC43NywzMy41NCwxMTMuMTcsMzEuOTksMTEyLjd6Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiNEMjc4NTY7IiBkPSJNMzcuNzYsMTEzLjU1Yy0wLjg4LTAuMDQtMS44MSwwLjg1LTEuOTIsMy40M2MtMC4wOSwyLjE2LDAsMy45NCwxLjIyLDQuMDQKCWMxLjY0LDAuMTMsMS4xOC0xLjk3LDEuMjctMy43MUMzOC4zNywxMTYuMzIsMzkuNTksMTEzLjY0LDM3Ljc2LDExMy41NXoiLz4KPHBhdGggc3R5bGU9ImZpbGw6I0QyNzg1NjsiIGQ9Ik02MC4xNSwxMTYuMzZjLTEuNDEsMC0xLjQ1LDEuNi0xLjQ1LDMuMzNjMCwxLjc0LTAuMzYsMy44OSwxLjIyLDQuMDhjMS45MiwwLjIzLDEuNTUtMi4zNSwxLjU1LTMuOAoJQzYxLjQ2LDExOC43MSw2MS42OSwxMTYuMzYsNjAuMTUsMTE2LjM2eiIvPgo8cGF0aCBzdHlsZT0iZmlsbDojRDI3ODU2OyIgZD0iTTY2LjUzLDExNi4wNGMtMS4xMywwLjIzLTEuMDMsMS43OC0wLjk5LDMuNjZjMC4wNSwxLjg4LTAuMjMsMy44NywxLjM2LDMuNzEKCWMxLjM2LTAuMTQsMS4yNy0yLjM1LDEuMjItNC4wNEM2OC4wOCwxMTcuOTEsNjguMjcsMTE1LjY3LDY2LjUzLDExNi4wNHoiLz4KPHBhdGggc3R5bGU9ImZpbGw6I0QyNzg1NjsiIGQ9Ik04NS44NiwxMDMuODFjLTAuOTctMC4xOS0yLjA3LDAuNjMtMi4zNSwyLjgyYy0wLjIzLDEuODgtMC4xNCwzLjUzLDEuNSwzLjg5CgljMC44NCwwLjE5LDAuOTktMS45NywxLjAzLTMuNTJDODYuMDksMTA1LjY2LDg3LjA4LDEwNC4wNSw4NS44NiwxMDMuODF6Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiNEMjc4NTY7IiBkPSJNOTEuMTYsMTA0Ljk1Yy0wLjkzLTAuMTUtMS44NCwwLjQyLTIuMDgsMi43NWMtMC4xNCwxLjM2LTAuNjQsMy44LDEuMDUsMy44OQoJYzEuMzEsMC4wNiwxLjIxLTIuMDksMS4zMy0zLjIxQzkxLjY1LDEwNi42MSw5Mi42OSwxMDUuMjEsOTEuMTYsMTA0Ljk1eiIvPgo8L3N2Zz4K', bone: 'data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPCEtLSBHZW5lcmF0b3I6IEFkb2JlIElsbHVzdHJhdG9yIDI0LjEuMiwgU1ZHIEV4cG9ydCBQbHVnLUluIC4gU1ZHIFZlcnNpb246IDYuMDAgQnVpbGQgMCkgIC0tPgo8c3ZnIHZlcnNpb249IjEuMSIgaWQ9IkxheWVyXzQiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGxpbmsiIHg9IjBweCIgeT0iMHB4IgoJIHZpZXdCb3g9IjAgMCAxMjggMTI4IiBzdHlsZT0iZW5hYmxlLWJhY2tncm91bmQ6bmV3IDAgMCAxMjggMTI4OyIgeG1sOnNwYWNlPSJwcmVzZXJ2ZSI+CjxnIHN0eWxlPSJkaXNwbGF5Om5vbmU7Ij4KCTxwYXRoIHN0eWxlPSJkaXNwbGF5OmlubGluZTtmaWxsOiNGQ0VBQ0M7IiBkPSJNMTIyLDgxLjE0Yy00LjIxLTUuOS0xNC4yMi01LjQ5LTE3LjAzLTUuMzhsLTAuMzcsMC4wMQoJCWMtNC45NCwwLjItOS43NC0xLjctMTMuMi01LjIyTDU3LjMsMzYuNDVjLTMuNDctMy41My01LjI4LTguMzYtNC45OS0xMy4yOWwwLjAyLTAuMzdjMC4xNi0yLjgsMC4zNS02LjU3LTAuMDUtOS41MgoJCUM1MS42Niw4LjcsNDcuMDUsMS43LDM0Ljk5LDQuMTVjLTYuMjIsMS4yNi04LjU3LDMuNzItOS4wNCw5LjU2Yy0wLjEsMS4yNCwwLjUzLDcuNjUtMS45NCwxMC4yMmMtMS4yMiwxLjI3LTguMTEsMC42Mi05LjM1LDAuNwoJCUM4LjgxLDI1LjAxLDMuOSwyOS4xOSwzLjksMzcuNTdjLTAuMDEsOS4wNyw1LjY4LDE0LjI1LDguOTUsMTQuNDVjMi45NywwLjE4LDYuNzEsMC4zMyw5LjUyLDAuMjJsOC41OS0wLjQzCgkJYzAsMCwxLjE1LDEuMTQsNC42MSw0LjY2bDM0LjQ4LDM1LjA4YzMuNDcsMy41Myw1LjI4LDguMzYsNC45OSwxMy4yOWwtMC4wMiwwLjM3Yy0wLjE2LDIuOC0xLjcyLDEzLjI4LDUuMDcsMTcuMTIKCQljMC45NCwwLjUzLDUuNiwyLjg0LDEyLjI3LDEuNTNjNi4yMy0xLjIzLDguNTctMy43Miw5LjA0LTkuNTZjMC4xLTEuMjQsMC4xMS04Ljg3LDIuNjUtMTEuMzZjMi41NC0yLjQ5LDguNDMtMS41Miw5LjY3LTEuNgoJCWM1Ljg1LTAuMzcsOS4zMi0xLjk5LDEwLjQ5LTguMjNDMTI1LjI0LDg3LjYxLDEyMi42Myw4Mi4wMiwxMjIsODEuMTR6Ii8+Cgk8cGF0aCBzdHlsZT0iZGlzcGxheTppbmxpbmU7ZmlsbDojODhDNEQ4OyIgZD0iTTM3LjY1LDIuMTdjLTMuNzUtMC40OC01Ljc1LDQuNDUtNS40NSw4LjIyYzAuMjksMy43NywxLjQsOC4wNC0xLDEwLjk2CgkJYy0zLjQsNC4xNS0xMC41OSwxLjcyLTE1LDQuNzhjLTEuNTEsMS4wNS0yLjU2LDIuNy0zLjAxLDQuNDhjLTEuMTMsNC4zNywxLjY4LDkuMzcsNS45OSwxMC42OWMzLjg4LDEuMTksOC4wNS0wLjM4LDEyLjEtMC4xNQoJCWM4LjA5LDAuNDYsMTMuODksNy42MywxOSwxMy45MWM1LjkyLDcuMjcsMTIuMzMsMTQuMTUsMTkuMTgsMjAuNTVjNS41NSw1LjE5LDExLjcsMTAuNTksMTMuNCwxOGMxLjQxLDYuMTMtMC41MiwxMi41NywwLjIxLDE4LjgyCgkJYzAuMTUsMS4zMywwLjQ0LDIuNjcsMS4xNSwzLjhjMi40NCwzLjg5LDguNjgsMy4yNiwxMi4wNSwwLjE0YzMuMzctMy4xMiw0LjgtNy43Myw2LjcyLTExLjljMS45Mi00LjE3LDQuOTctOC40Miw5LjUtOS4xOQoJCWMyLjg5LTAuNDksNi4wOCwwLjUzLDguNjctMC44NWMwLjY2LTAuMzUsMS4yNC0wLjg0LDEuOTUtMS4wN2MyLjM2LTAuNzgsNC41NiwxLjYsNS41NiwzLjg3YzQuMzcsOS45Mi0wLjM0LDIyLjExLTguNzIsMjguOTgKCQljLTguMzgsNi44Ny0xOS41Niw5LjMzLTMwLjM4LDEwLjAyYy0yNi4wMywxLjY2LTUzLjE0LTYuMjktNzIuMTYtMjQuMTRDOS42OSwxMDQuODcsMy40MSw5Ni4xOC0xLjU0LDg2Ljg0CgkJYy03LjI4LTEzLjczLTExLjc2LTI5LTEyLjQtNDQuNTNjLTAuNDktMTEuNzUsMS4zMy0yMy44Nyw3LjItMzQuMDZTOS40OS05Ljk0LDIxLjItMTEuMDciLz4KPC9nPgo8Zz4KCTxwYXRoIHN0eWxlPSJmaWxsOiNGQ0VBQ0M7IiBkPSJNMTIyLDgxLjE0Yy00LjIxLTUuOS0xNC4yMi01LjQ5LTE3LjAzLTUuMzhsLTAuMzcsMC4wMWMtNC45NCwwLjItOS43NC0xLjctMTMuMi01LjIyTDU3LjMsMzYuNDUKCQljLTMuNDctMy41My01LjI4LTguMzYtNC45OS0xMy4yOWwwLjAyLTAuMzdjMC4xNi0yLjgsMC4zNS02LjU3LTAuMDUtOS41MkM1MS42Niw4LjcsNDcuMDUsMS43LDM0Ljk5LDQuMTUKCQljLTYuMjIsMS4yNi04LjU3LDMuNzItOS4wNCw5LjU2Yy0wLjEsMS4yNCwwLjUzLDcuNjUtMS45NCwxMC4yMmMtMS4yMiwxLjI3LTguMTEsMC42Mi05LjM1LDAuN0M4LjgxLDI1LjAxLDMuOSwyOS4xOSwzLjksMzcuNTcKCQljLTAuMDEsOS4wNyw1LjY4LDE0LjI1LDguOTUsMTQuNDVjMi45NywwLjE4LDYuNzEsMC4zMyw5LjUyLDAuMjJsOC41OS0wLjQzYzAsMCwxLjE1LDEuMTQsNC42MSw0LjY2bDM0LjQ4LDM1LjA4CgkJYzMuNDcsMy41Myw1LjI4LDguMzYsNC45OSwxMy4yOWwtMC4wMiwwLjM3Yy0wLjE2LDIuOC0xLjcyLDEzLjI4LDUuMDcsMTcuMTJjMC45NCwwLjUzLDUuNiwyLjg0LDEyLjI3LDEuNTMKCQljNi4yMy0xLjIzLDguNTctMy43Miw5LjA0LTkuNTZjMC4xLTEuMjQsMC4xMS04Ljg3LDIuNjUtMTEuMzZjMi41NC0yLjQ5LDguNDMtMS41Miw5LjY3LTEuNmM1Ljg1LTAuMzcsOS4zMi0xLjk5LDEwLjQ5LTguMjMKCQlDMTI1LjI0LDg3LjYxLDEyMi42Myw4Mi4wMiwxMjIsODEuMTR6Ii8+Cgk8cGF0aCBzdHlsZT0iZmlsbDojREVCQ0E4OyIgZD0iTTI2LjI2LDExLjFjMC44LTMuMDcsNC45Mi0yLjY2LDUuOTQtMS42N2MxLjA1LDEuMDEsMS42MywyLjQyLDEuODIsMy44NAoJCWMwLjc1LDUuODEtMS4yLDkuMTUtMy4yMywxMC4yNGMtMi4wNiwxLjA5LTMuNDMsMS4yOC02LjQ4LDEuNTljLTEuODUsMC4xOS0zLjM4LTAuMTEtMi43My0wLjQ2YzEuMDMtMC41NSwzLjE0LTEuOTksMy42LTIuODMKCQljMC41My0wLjk4LDAuNTEtMS44NiwwLjYxLTIuOUMyNi4wMywxNi4zMSwyNS41OSwxMy42NiwyNi4yNiwxMS4xeiIvPgoJPHBhdGggc3R5bGU9ImZpbGw6I0RFQkNBODsiIGQ9Ik0xMjQuMjEsOTMuMWMwLTAuMDIsMC4wMS0wLjA0LDAuMDEtMC4wNmMwLjMyLTEuNzUtMS43Mi0zLTMuMTUtMS45NWMtMC4zMywwLjI0LTAuNywwLjQ4LTEuMDksMC43CgkJYy00LjA5LDIuMjktOS43MywwLjQ2LTEzLjU1LDMuMTdjLTYuNzksNC44Mi0yLjgyLDE3Ljg1LTcuNDMsMjAuOTVjLTIuNjMsMS43Ny03LjczLDIuMy0xMC41NSwwLjg3Yy00LjU1LTIuMy01LjI0LTUuMTktNS40OC04LjM1CgkJYy0wLjM2LTQuNzMtMC40MS0xMC4wNC0xLjE0LTEzLjcyYy0wLjk5LTQuOTgtNy4yNy0xMS43Mi03LjI3LTExLjcyUzQ4LjgsNTQuNzUsMzkuMTIsNDUuOTZjLTMuNzItMy4zNy05LjUxLTIuMjEtMTMuOTMtMS42NwoJCWMtNS4xNywwLjYyLTguNiwwLjE5LTExLjYzLTIuNHMtMy44NS04LjU0LTIuNTktMTIuMzJzNy4wMS00Ljg2LDcuMDEtNC44NmMtMi4wMi0wLjA5LTIuNy0wLjEyLTMuMzMtMC4wOAoJCUM4LjgxLDI1LjAxLDMuOSwyOS4xOSwzLjksMzcuNTdjLTAuMDEsOS4wNyw1LjQyLDEzLjc2LDguNiwxNC41NWMzLjU4LDAuOSwxMi45Ni0wLjA0LDEyLjk2LTAuMDRzNS4wNy0wLjcsNy4xNSwxLjM4CgkJYzAuNzEsMC43MSwxLjY4LDEuNywyLjk2LDMuMDFsMzQuNDgsMzUuMDhjMy40NywzLjUzLDUuMjgsOC4zNiw0Ljk5LDEzLjI5bC0wLjAyLDAuMzdjLTAuMTYsMi44LTEuNzIsMTMuMjgsNS4wNywxNy4xMgoJCWMwLjk0LDAuNTMsNS42LDIuODQsMTIuMjcsMS41M2M2LjIzLTEuMjMsOC41Ny0zLjcyLDkuMDQtOS41NmMwLjEtMS4yNCwwLjExLTguODcsMi42NS0xMS4zNmMyLjU0LTIuNDksOC40My0xLjUyLDkuNjctMS42CgkJQzExOS41NywxMDAuOTYsMTIzLjA1LDk5LjM0LDEyNC4yMSw5My4xeiIvPgo8L2c+Cjwvc3ZnPgo=' };
+  for (const k in SRC) { IMG[k] = new Image(); IMG[k].src = SRC[k]; }
+  const DOG = 116;   // 강아지 이미지 크기(px)
+
+  function drawDogImg(sx, sy, rot, side = false) {
+    // side=true: 옆모습 강아지(원본은 왼쪽을 봄 → 좌우 반전해서 오른쪽(달리는 방향)을 보게 함)
+    const img = side ? IMG.side : IMG.dog;
+    if (!img.complete) return;
+    ctx.save(); ctx.rotate(rot); ctx.scale(side ? -sx : sx, sy);
+    if (side) ctx.drawImage(img, -66, -118, 132, 132);
+    else ctx.drawImage(img, -DOG / 2, -DOG + 4, DOG, DOG);
+    ctx.restore();
+  }
+
+  function drawDog() {
+    const running = state === 'run';
+    const jumping = !!jump;
+    const eating = treat && treat.t > 0.5;
+    let lift = 0;
+    if (jumping) lift = Math.sin(Math.PI * jump.t / 0.75) * 85;
+    if (treat && treat.t > 0.6 && treat.t < 1.2) lift = Math.sin((treat.t - 0.6) / 0.6 * Math.PI) * 26;
+
+    ctx.fillStyle = 'rgba(0,0,0,.14)';
+    ctx.beginPath(); ctx.ellipse(dogX, GY + 4, 42 - lift * 0.2, 8, 0, 0, 7); ctx.fill();
+
+    ctx.save();
+    ctx.translate(dogX, GY - lift);
+
+    if (state === 'sit') {
+      // 앉아서 화면을 보며 기다림: 살짝 낮게 눌리고 몸을 좌우로 살랑
+      const sway = Math.sin(sitT * 8) * 0.05;
+      const breathe = 1 + Math.sin(sitT * 2.5) * 0.015;
+      drawDogImg(1.04, 0.88 * breathe, sway - 0.08, true);
+      ctx.restore();
+      drawBubble();
+      ctx.save();               // drawDog 끝의 restore 와 짝 맞추기
+      return;
+    }
+
+    let sx = 1, sy = 1, rot = 0, bob = 0;
+    if (jumping) { rot = -Math.cos(Math.PI * jump.t / 0.75) * 0.3; sx = 1.1; sy = 0.92; }
+    else if (running) {
+      bob = -Math.abs(Math.sin(runPhase)) * 11;
+      rot = 0.06 + Math.sin(runPhase) * 0.07;        // 앞으로 살짝 숙이며 출렁
+      sx = 1 + Math.sin(runPhase * 2) * 0.06; sy = 2 - sx;   // 달릴 때 늘었다 줄었다
+    } else { sy = 1 + Math.sin(t * 2.2) * 0.015; }
+    if (eating) { rot += -0.15; if (treat.eaten) rot += Math.sin(t * 24) * 0.04; }
+    ctx.translate(0, bob);
+    drawDogImg(sx, sy, rot, true);
+    ctx.restore();
+  }
+
+  function drawBubble() {
+    const bx = dogX + 95, by = GY - 175, bobb = Math.sin(sitT * 3) * 3;
+    ctx.save();
+    ctx.fillStyle = '#fff'; ctx.strokeStyle = '#d3d0d8'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(bx - 38, by + 52 + bobb, 4, 0, 7); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(bx - 24, by + 38 + bobb, 7, 0, 7); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(bx + 14, by + bobb, 40, 28, 0, 0, 7); ctx.fill(); ctx.stroke();
+    bone(bx + 14, by + bobb, 1.1, -0.3);
+    ctx.restore();
+  }
+
+  function drawHurdle(h) {
+    const x = h.x, y = GY - 4;
+    ctx.save(); ctx.lineCap = 'round';
+    ctx.strokeStyle = '#8a6a4a'; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y - 52); ctx.moveTo(x + 40, y); ctx.lineTo(x + 40, y - 52); ctx.stroke();
+    for (let i = 0; i < 2; i++) {
+      const by = y - 48 + i * 18;
+      for (let k = 0; k < 4; k++) {
+        ctx.fillStyle = k % 2 ? '#fff' : '#ff6b6b';
+        ctx.fillRect(x - 3 + k * 11.5, by - 5, 11.5, 10);
+      }
+      ctx.strokeStyle = '#c0504f'; ctx.lineWidth = 1.5; ctx.strokeRect(x - 3, by - 5, 46, 10);
+    }
+    ctx.restore();
+  }
+
+  // 간식 던지기: 화면 오른쪽 위에서 포물선으로 날아와 강아지 입으로
+  function drawTreat() {
+    if (!treat || treat.eaten) return;
+    const k = Math.min(1, treat.t / THROW_T);
+    const sx = W + 30, sy = GY - 230;
+    const ex = dogX + 50, ey = GY - 92;
+    const x = sx + (ex - sx) * k;
+    const y = sy + (ey - sy) * k - Math.sin(Math.PI * k) * 70;
+    // 궤적 반짝임
+    for (let i = 1; i <= 4; i++) {
+      const kk = Math.max(0, k - i * 0.05);
+      const tx = sx + (ex - sx) * kk, ty = sy + (ey - sy) * kk - Math.sin(Math.PI * kk) * 70;
+      ctx.fillStyle = `rgba(255,214,102,${0.5 - i * 0.1})`;
+      ctx.beginPath(); ctx.arc(tx, ty, 6 - i, 0, 7); ctx.fill();
+    }
+    bone(x, y, 1, k * 9);
+  }
+
+  /* ---------- 배경 ---------- */
+  function drawBackground() {
+    const sky = ctx.createLinearGradient(0, 0, 0, GY);
+    sky.addColorStop(0, '#a9dcff'); sky.addColorStop(1, '#e9f7ff');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff3b0'; ctx.beginPath(); ctx.arc(620, 60, 30, 0, 7); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.9)';
+    for (let i = 0; i < 4; i++) {
+      const cx = ((i * 260 - scroll * 0.1 - t * 6) % 1040 + 1040) % 1040 - 160, cy = 50 + (i % 2) * 40;
+      ctx.beginPath(); ctx.arc(cx, cy, 20, 0, 7); ctx.arc(cx + 24, cy - 8, 26, 0, 7); ctx.arc(cx + 52, cy, 20, 0, 7); ctx.fill();
+    }
+    ctx.fillStyle = '#bfe3a8';
+    for (let i = -1; i < 4; i++) {
+      const hx = ((i * 300 - scroll * 0.25) % 1200 + 1200) % 1200 - 300;
+      ctx.beginPath(); ctx.ellipse(hx + 150, GY - 10, 190, 70, 0, Math.PI, 0); ctx.fill();
+    }
+    for (let i = 0; i < 5; i++) {
+      const tx = ((i * 230 + 80 - scroll * 0.5) % 1150 + 1150) % 1150 - 150;
+      ctx.fillStyle = '#9b6b43'; ctx.fillRect(tx - 5, GY - 62, 10, 60);
+      ctx.fillStyle = '#6fbf6f'; ctx.beginPath(); ctx.arc(tx, GY - 78, 28, 0, 7); ctx.arc(tx - 18, GY - 62, 20, 0, 7); ctx.arc(tx + 18, GY - 62, 20, 0, 7); ctx.fill();
+    }
+    ctx.fillStyle = '#8fd17a'; ctx.fillRect(0, GY - 14, W, 14);
+    ctx.fillStyle = '#e6cfae'; ctx.fillRect(0, GY, W, H - GY);
+    ctx.fillStyle = '#d9bf99'; ctx.fillRect(0, GY, W, 6);
+    ctx.fillStyle = 'rgba(255,255,255,.75)';
+    for (let i = -1; i < 12; i++) {
+      const dx = ((i * 70 - scroll) % 840 + 840) % 840 - 70;
+      ctx.fillRect(dx, GY + 38, 36, 5);
+    }
+    const fx = START_X - 50 - scroll;
+    if (fx > -80) {
+      ctx.fillStyle = '#fff'; ctx.fillRect(fx, GY - 8, 6, 58);
+      ctx.fillStyle = '#ff6b8b'; ctx.fillRect(fx + 6, GY - 8, 44, 24);
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('START', fx + 28, GY + 9);
+    }
+  }
+
+  function draw() {
+    drawBackground();
+    hurdles.forEach(drawHurdle);
+    drawDog();
+    drawTreat();
+    for (const h of hearts) if (h.age > 0) heart(h.x, h.y - h.age * 50, 1.6, 1 - h.age / 1.2);
+  }
+
+  /* ---------- 루프 ---------- */
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    update(dt); draw();
+    if (running) renderTime();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  renderTime();
+</script>
+</body>
+</html>
